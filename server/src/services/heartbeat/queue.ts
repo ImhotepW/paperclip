@@ -14,6 +14,7 @@ import {
   isInteractionResolutionWakePayload,
 } from "./run-preparation.js";
 import { resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
+import { readGlobalMaxConcurrentRuns, withGlobalAdmissionLock } from "./global-admission.js";
 import {
   CHAT_COMPLETION_WAKE_REASON,
   isCompletedOnboardingHandoffWake,
@@ -689,6 +690,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           eq(heartbeatRuns.status, "running"),
         ),
       );
+    return Number(count ?? 0);
+  }
+
+  async function countRunningRuns() {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
     return Number(count ?? 0);
   }
 
@@ -1886,6 +1895,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
     }
 
+    if (readGlobalMaxConcurrentRuns() !== null) {
+      await startQueuedRunsAcrossAgents();
+      return;
+    }
+
     const queuedRuns = await db
       .select({ agentId: heartbeatRuns.agentId })
       .from(heartbeatRuns)
@@ -1900,7 +1914,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
     const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      await startQueuedRunsForAgent(agentId);
     }
   }
 
@@ -1943,16 +1957,55 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
+  // With an instance-wide cap, a freed slot goes to the agent whose queued run
+  // has waited longest, whichever agent's wake or completion triggered the call.
+  // Without a cap, each agent fills only its own slots, as before.
   async function startNextQueuedRunForAgent(agentId: string) {
+    if (readGlobalMaxConcurrentRuns() === null) return startQueuedRunsForAgent(agentId);
+    return startQueuedRunsAcrossAgents();
+  }
+
+  async function startQueuedRunsAcrossAgents() {
+    const limit = readGlobalMaxConcurrentRuns();
+    if (limit === null) return [];
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
+    const waitingAgents = await db
+      .select({ agentId: heartbeatRuns.agentId, oldestQueuedAt: sql<Date>`min(${heartbeatRuns.createdAt})` })
+      .from(heartbeatRuns)
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .where(
+        and(
+          eq(heartbeatRuns.status, "queued"),
+          eq(companies.status, "active"),
+          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+        ),
+      )
+      .groupBy(heartbeatRuns.agentId)
+      .orderBy(sql`min(${heartbeatRuns.createdAt})`);
+    const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+    for (const { agentId } of waitingAgents) {
+      if ((await countRunningRuns()) >= limit) break;
+      claimedRuns.push(...(await startQueuedRunsForAgent(agentId)));
+    }
+    return claimedRuns;
+  }
+
+  async function startQueuedRunsForAgent(agentId: string) {
+    if ((await getSchedulingSuppression()).suppressed) return [];
+    const cutoff = await getWorktreeExecutionCutoff();
+    const globalLimit = readGlobalMaxConcurrentRuns();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.
     const rejectedClaims: Array<{ run: typeof heartbeatRuns.$inferSelect; err: HttpError }> = [];
     const deferredPostCommitEffects: WakeQueuePostCommitEffect[] = [];
     let cancellationReason: string | undefined;
 
-    return withAgentStartLock(agentId, async () => {
+    // The global lock spans the running count and the claims, so concurrent
+    // admissions for different agents cannot both take the last free slot.
+    const admit = <T,>(fn: () => Promise<T>) => (globalLimit === null ? fn() : withGlobalAdmissionLock(fn));
+
+    return withAgentStartLock(agentId, () => admit(async () => {
       const agent = await getAgent(agentId);
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
@@ -1966,7 +2019,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const runningCount = await countRunningRunsForAgent(agentId);
       const availableSlots = Math.max(
         0,
-        policy.maxConcurrentRuns - runningCount,
+        Math.min(
+          policy.maxConcurrentRuns - runningCount,
+          globalLimit === null ? Number.POSITIVE_INFINITY : globalLimit - (await countRunningRuns()),
+        ),
       );
       if (availableSlots <= 0) return [];
 
@@ -2098,7 +2154,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         });
       }
       return claimedRuns;
-    }).finally(async () => {
+    })).finally(async () => {
       // Dispatch promoted inputs after the agent start lock is released.
       try {
         await applyWakeQueuePostCommitEffects(deferredPostCommitEffects);

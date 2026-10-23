@@ -27,7 +27,7 @@ are relative to `server/src/services/heartbeat/`:
 
 | Modules | Responsibility |
 | --- | --- |
-| `queue.ts`, `scheduling.ts` | Queue admission, coalescing, and dispatch; timer and monitor scheduling. |
+| `queue.ts`, `scheduling.ts`, `global-admission.ts` | Queue admission, coalescing, and dispatch; the optional instance-wide run cap; timer and monitor scheduling. |
 | `run-preparation.ts`, `execution-configuration.ts` | Run context and tool access; effective execution configuration and credentials. |
 | `session-preparation.ts`, `run-state.ts` | Session selection and resume preparation; persisted run/session state and retrieval. |
 | `workspaces.ts`, `workspace-preparation.ts` | Workspace resolution, reuse, and validation; preparing the selected workspace and acquiring its environment. |

@@ -2,7 +2,7 @@ import { claimNativeSessionResumptions } from "../native-runtime/native-finaliza
 import type { Db } from "@paperclipai/db";
 import { agents, agentWakeupRequests, caseHandoffs, cases, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueComments, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
@@ -293,6 +293,89 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     deps.getAgent.mockResolvedValue(agent);
     expect(await createHeartbeatQueue(db, deps).claimQueuedRun(admitted)).toMatchObject({ id: run.id, status: "running" });
     expect(deps.canStartNewExternalBotWork).not.toHaveBeenCalled();
+  });
+
+  describe("instance-wide concurrency cap", () => {
+    const previousCap = process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS;
+    afterEach(() => {
+      if (previousCap === undefined) delete process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS;
+      else process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS = previousCap;
+    });
+
+    async function queuedAgents(count: number) {
+      const [company] = await db.insert(companies).values({ name: "Global cap", issuePrefix: "GC" }).returning();
+      const seeded = [];
+      for (let index = 0; index < count; index++) {
+        const [agent] = await db.insert(agents).values({ companyId: company.id, name: `Capped agent ${index}`, role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+        const [issue] = await db.insert(issues).values({ companyId: company.id, title: `Capped task ${index}`, status: "todo", assigneeAgentId: agent.id }).returning();
+        const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "queued", invocationSource: "assignment", responsibleUserId: "queue-test-user",
+          contextSnapshot: { issueId: issue.id }, createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)) }).returning();
+        seeded.push({ agent, issue, run });
+      }
+      const deps = callbacks(db);
+      const byId = new Map(seeded.map(({ agent }) => [agent.id, agent]));
+      deps.getAgent.mockImplementation(async (agentId: string) => byId.get(agentId) ?? null);
+      return { company, seeded, deps };
+    }
+
+    async function statusesById() {
+      const rows = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns);
+      return new Map(rows.map((row) => [row.id, row.status]));
+    }
+
+    it("admits one run instance-wide when concurrent wakes race for the last slot", async () => {
+      process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS = "1";
+      const { seeded, deps } = await queuedAgents(5);
+      const queue = createHeartbeatQueue(db, deps);
+      await Promise.all(seeded.map(({ agent }) => queue.startNextQueuedRunForAgent(agent.id)));
+      const statuses = await statusesById();
+      expect([...statuses.values()].filter((status) => status === "running")).toHaveLength(1);
+      expect([...statuses.values()].filter((status) => status === "queued")).toHaveLength(4);
+      expect(deps.executeRun).toHaveBeenCalledTimes(1);
+    });
+
+    it("gives a freed slot to the longest-waiting agent, not the one that finished", async () => {
+      process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS = "1";
+      const { company, seeded, deps } = await queuedAgents(2);
+      const [finisher, waiter] = seeded;
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, finisher.run.id));
+      const [finisherNext] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: finisher.agent.id, status: "queued",
+        invocationSource: "assignment", responsibleUserId: "queue-test-user", contextSnapshot: { issueId: finisher.issue.id }, createdAt: new Date(Date.UTC(2026, 0, 1, 1)) }).returning();
+      await createHeartbeatQueue(db, deps).startNextQueuedRunForAgent(finisher.agent.id);
+      const statuses = await statusesById();
+      expect(statuses.get(waiter.run.id)).toBe("running");
+      expect(statuses.get(finisherNext.id)).toBe("queued");
+      expect(deps.executeRun).toHaveBeenCalledExactlyOnceWith(waiter.run.id);
+    });
+
+    it("counts runs that are already running toward the cap", async () => {
+      process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS = "1";
+      const { seeded, deps } = await queuedAgents(2);
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, seeded[0].run.id));
+      expect(await createHeartbeatQueue(db, deps).startNextQueuedRunForAgent(seeded[1].agent.id)).toEqual([]);
+      expect((await statusesById()).get(seeded[1].run.id)).toBe("queued");
+      expect(deps.executeRun).not.toHaveBeenCalled();
+    });
+
+    it("fills up to the cap from the periodic resume pass", async () => {
+      process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS = "2";
+      const { seeded, deps } = await queuedAgents(4);
+      await createHeartbeatQueue(db, deps).resumeQueuedRuns();
+      const statuses = await statusesById();
+      expect(seeded.map(({ run }) => statuses.get(run.id))).toEqual(["running", "running", "queued", "queued"]);
+    });
+
+    it("keeps admission per agent when no cap is set", async () => {
+      delete process.env.PAPERCLIP_GLOBAL_MAX_CONCURRENT_RUNS;
+      const { seeded, deps } = await queuedAgents(3);
+      const queue = createHeartbeatQueue(db, deps);
+      await queue.startNextQueuedRunForAgent(seeded[2].agent.id);
+      let statuses = await statusesById();
+      expect(seeded.map(({ run }) => statuses.get(run.id))).toEqual(["queued", "queued", "running"]);
+      await Promise.all(seeded.map(({ agent }) => queue.startNextQueuedRunForAgent(agent.id)));
+      statuses = await statusesById();
+      expect(seeded.map(({ run }) => statuses.get(run.id))).toEqual(["running", "running", "running"]);
+    });
   });
 
   it("cancels at the daily run cap before claiming or dispatching", async () => {
